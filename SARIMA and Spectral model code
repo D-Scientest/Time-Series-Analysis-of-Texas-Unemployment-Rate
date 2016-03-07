@@ -1,0 +1,450 @@
+library(quantmod)
+library(xtsPlots)
+library(xts)
+library(forecast)
+library(MASS)
+library(tseries)
+
+
+# Input data from FRED(Texas Umemployment Rate without seasonal adjustment)
+tx_umrate <- as.xts(getSymbols("TXURN", src = "FRED", auto.assign = F))
+plot.xts(tx_umrate)# No obvious variance change
+                   # Seasonality: Year pattern
+                   # Cylic behavior: 5-10 years
+#split data into three blocks: training, validation and testing
+tx_umrate_tr <- tx_umrate[1:(length(tx_umrate)*0.6)]
+tx_umrate_va <- tx_umrate[(length(tx_umrate)*0.6+1):(length(tx_umrate)*0.8)]
+tx_umrate_te <- tx_umrate[(length(tx_umrate)*0.8+1):length(tx_umrate)]
+plot.xts(tx_umrate, main = "Texas Unemployment Rate(no seasonal adjustment)")
+
+#Basic time series test
+round(BoxCox.lambda(tx_umrate_tr),4) #No transform needed
+Box.test(tx_umrate_tr, lag = 100, "Ljung-Box")
+
+par(mai=c(.2, .5, .3, 0.05), mgp=c(1, 0.1, 0), tck=0, mfrow=c(1,2))
+Acf(tx_umrate_tr, lag.max = 100)
+Pacf(tx_umrate_tr, lag.max = 100) #The value of lag 1 pacf is near 1 and there might be a unstationary problem
+adf.test(tx_umrate_tr) #Augmented Dickey-Fuller Test confirm the result
+
+#############################################
+# Remove unit root
+#############################################
+tx_umrate_tr_diff <- diff(tx_umrate_tr)[2:length(tx_umrate_tr)]
+plot.xts(tx_umrate_tr_diff, main = "Unemployment Rate Series after Difference") 
+par(mai=c(.2, .5, .3, 0.05), mgp=c(1, 0.1, 0), tck=0, mfrow=c(1,2))
+Acf(tx_umrate_tr_diff,lag.max = 100, main = "ACF")
+pacf(tx_umrate_tr_diff, lag.max = 50, main = "PACF")
+
+#############################################
+# Seasonality
+#############################################
+
+###################################
+#Seasonal arima model
+###################################
+tx_umrate_tr_diff_sdiff <- diff(tx_umrate_tr_diff, lag = 12)[13:length(tx_umrate_tr_diff)]
+par(mai=c(.2, .5, .3, 0.05), mgp=c(1, 0.1, 0), tck=0, mfrow=c(1,2))
+plot.xts(tx_umrate_tr_diff_sdiff)
+
+##############
+#Model selection by acf & pacf
+##############
+Acf(tx_umrate_tr_diff_sdiff,lag.max = 50, main = "ACF")
+pacf(tx_umrate_tr_diff_sdiff, lag.max = 100, main = "PACF")
+#Between Seasons: Acf is cutting off a lag 1s (s=12)
+#                 Pacf is tailing off at lag 1s, 2s, 3s .....
+#                 Imply an SMA(1), P=0, Q=1, in the season(s=12)
+#Within Seasons: ARMA(2,2) within seasons, p = q = 1
+#Final model: ARIMA(2,1,2) * (0,1,1)_{12}
+
+
+##############
+#Model selection by AIC & AICc
+##############
+p <- 3
+q <- 3
+aic_val <- matrix(0,9,3)
+
+for (i in 1:3){
+  for (j in 1:3){
+    txur_reg <- Arima(tx_umrate_tr,order = c(i,1,j), seasonal = list(order = c(0,1,1), period = 12))
+    aic_val[((i-1)*3+j),1] <- txur_reg$aic
+    aic_val[((i-1)*3+j),2] <- txur_reg$aicc
+    aic_val[((i-1)*3+j),3] <- txur_reg$bic
+  }
+}
+which(aic_val[,1] == min(aic_val[,1]))#6
+which(aic_val[,2] == min(aic_val[,2]))#6
+which(aic_val[,3] == min(aic_val[,3]))#2
+#Both AIC and AICC prefer ARIMA(2,1,3) * (0,1,1)_{12}
+
+
+###########
+#Forecast performance(Sarima)
+###########
+k <- length(tx_umrate_tr) # minimum data length for fitting a model
+n <- length(tx_umrate_va) + length(tx_umrate_tr)
+se_vali_arima <- matrix(NA,n-k,9)
+st <- k
+
+for (p in 1:3){
+  for (q in 1:3){
+    for(i in 1:(n-k))
+    {
+      xshort <- tx_umrate[1:(k+i-1)]
+      xnext <- tx_umrate[(k + i)]
+      xlong <- tx_umrate[1:(k + i)]
+      fit <- Arima(xshort, order=c(p,1,q), seasonal=list(order=c(0,1,1), period=12))
+      fita <- Arima(xlong, model=fit)
+      fcast <- fitted(fita)[-(1:length(xshort))]
+      se_vali_arima[i,((p-1)*3+q)] <- (fcast-xnext)^2
+    } 
+  }
+}
+
+save(se_vali_arima, file="se_vali_arima.RData")
+#load("se_vali_arima.RData")
+mse_vali_arima <- colMeans(se_vali_arima,na.rm=TRUE)
+plot(1:9, mse_vali_arima, type = "l")
+which.min(mse_vali_arima)
+#Finally we choose the ARIMA(3,1,2) * (0,1,1)_{12}
+
+
+###########
+#Final Arima Model
+###########
+final_sarima <- Arima(tx_umrate, order=c(3,1,2), seasonal=list(order=c(0,1,1), period=12))
+###########
+#Diagnostic
+###########
+
+###
+#constant variance
+###
+sarima_resid <- resid(final_sarima)[13:length(tx_umrate_tr)]
+plot(index(tx_umrate_tr)[13:length(tx_umrate_tr)], sarima_resid, main = "Residuals of ARIMA(3,1,2)(0,1,1)_12", xlab = "index", ylab = "resid")
+# Randomly distributed, constant variance
+
+###
+#Normality
+###
+qqnorm(sarima_resid, main = "Q-Q plot for residuals from ARIMA(3,1,2)(0,1,1)_12");qqline(sarima_resid)
+
+###
+#Correlatedness
+###
+(btest <- Box.test(sarima_resid, type = 'Ljung-Box'))
+#Can't reject the Null hypothesis that residuals are uncorrelated
+Acf(sarima_resid, main = "ACF for residuals from ARIMA(3,1,2)(0,1,1)_12")
+
+#####
+#forcest performance
+#####
+plot(forecast(final_sarima,h =15), xlim = c(300, 500))
+
+original_data <- as.vector(tx_umrate)
+forecast_data <- as.vector(tx_umrate)
+up_pi_data95 <- original_data[480]
+down_pi_data95 <- original_data[480]
+up_pi_data80 <- original_data[480]
+down_pi_data80 <- original_data[480]
+
+
+for (i in 1:12){
+  dy_sarima_forecast <- Arima(forecast_data, model=final_sarima)
+  fore <- forecast(dy_sarima_forecast,h =1)
+  one_step_forecast <- fore$mean
+  up_pi_data95 <- append(up_pi_data95, fore$upper[2])
+  up_pi_data80 <- append(up_pi_data80, fore$upper[1])
+  down_pi_data95 <- append(down_pi_data95, fore$lower[2])
+  down_pi_data80 <- append(down_pi_data80, fore$lower[1])
+  forecast_data <- append(forecast_data, one_step_forecast)
+}
+
+for_len <- length(forecast_data)
+ori_len <- length(original_data)
+plot(ori_len:for_len, forecast_data[480:492],col="red",lwd=2,ylim=c(2,10), xlim= c(300,500),type="l", ylab = "unemployment rate", xlab = "time", main = "SARIMA One Year Forecasting")
+lines(1:ori_len,original_data,col=c("black"),lwd=1)
+lines(ori_len:for_len,up_pi_data95,col="orange",lwd=1)
+lines(ori_len:for_len,down_pi_data95,col="orange",lwd=1)
+lines(ori_len:for_len,up_pi_data80,col="steelblue",lwd=1)
+lines(ori_len:for_len,down_pi_data80,col="steelblue",lwd=1)
+
+
+
+#####
+#cyclic addition
+#####
+phi <- c(-0.2389, 0.2222, 0.7227)
+polyroot(c(1, -phi))
+a <- -0.7092446; b <- 0.8616216
+k <- 2 * pi/(acos(a/(2*sqrt(a^2 + b^2))))
+#phi <- c(1.3938, -0.4960)
+#cyclic <- 2*pi/(acos(phi[1]/(2*sqrt(-phi[2]))))/12
+
+
+
+###########
+#Generalization performance(Sarima)
+###########
+k <- length(tx_umrate_va) + length(tx_umrate_tr) # minimum data length for fitting a model
+n <- length(tx_umrate)
+se_test_arima <- matrix(NA,n-k,1)
+st <- k
+p <- 3;q<- 2
+for(i in 1:(n-k))
+  {
+    xshort <- tx_umrate[1:(k+i-1)]
+    xnext <- tx_umrate[(k + i)]
+    xlong <- tx_umrate[1:(k + i)]
+    fit <- Arima(xshort, order=c(p,1,q), seasonal=list(order=c(0,1,1), period=12))
+    fita <- Arima(xlong, model=fit)
+    fcast <- fitted(fita)[-(1:length(xshort))]
+    se_test_arima[i] <- (fcast-xnext)^2
+  } 
+
+mse_test_airma <- colMeans(se_test_arima,na.rm=TRUE)
+
+
+
+###################################
+#Spectral model
+###################################
+plot.xts(tx_umrate_tr_diff) 
+Acf(tx_umrate_tr_diff,100)
+# From ACF we can find that there is an abovious cos shape.
+pacf(tx_umrate_tr_diff,100)
+
+I <- abs(fft(tx_umrate_tr_diff))^2/length(tx_umrate_tr_diff)
+P <- (4/length(tx_umrate_tr_diff))*I[1:(length(tx_umrate_tr_diff)/2)]
+f = 0:(length(tx_umrate_tr_diff)/2-1)/length(tx_umrate_tr_diff)
+
+plot(f, P, type="o", xlab="Frequency", ylab="Scaled Periodogram",lwd=2,col="darkblue", main = 'Periodogram for Unemployment Rate after Difference')
+
+temp_sort <- sort(as.numeric(P), decreasing = TRUE)
+com_1 <- which(P == temp_sort[1])
+com_2 <- which(P == temp_sort[2])
+com_3 <- which(P == temp_sort[3])
+#com_4 <- which(P == temp_sort[8])
+
+abline(v=c(f[com_1], f[com_2], f[com_3]), col="red")
+
+fractions(f[com_1])# 6 months
+fractions(f[com_2])# 4 months
+fractions(f[com_3])# 2.5 months
+#fractions(f[com_4])# 1 month
+
+
+freqs <- c(48/287, 72/287, 120/287)
+lur <- length(tx_umrate_tr_diff)
+
+f11 <- cos(2*pi*freqs[1]*1:lur); f12 <- sin(2*pi*freqs[1]*1:lur)
+f21 <- cos(2*pi*freqs[2]*1:lur); f22 <- sin(2*pi*freqs[2]*1:lur)
+f31 <- cos(2*pi*freqs[3]*1:lur); f32 <- sin(2*pi*freqs[3]*1:lur)
+new_data <- function(x){
+  f11 <- cos(2*pi*freqs[1]*x); f12 <- sin(2*pi*freqs[1]*x)
+  f21 <- cos(2*pi*freqs[2]*x); f22 <- sin(2*pi*freqs[2]*x)
+  f31 <- cos(2*pi*freqs[3]*x); f32 <- sin(2*pi*freqs[3]*x)
+  return(data.frame(f11,f12,f21,f22,f31,f32))
+}
+
+spec_fit <- lm(tx_umrate_tr_diff ~ f11 + f12 + f21 + f22 + f31 + f32 - 1)
+fitted_value <- c(predict.lm(spec_fit), predict.lm(spec_fit,new_data(288)))
+
+spec_fit_resid <- resid(spec_fit)
+
+###########
+#Diagnostic
+###########
+
+###
+#constant variance
+###
+plot(1:length(spec_fit_resid), spec_fit_resid, main = "Residuals", xlab = "index", ylab = "resid")
+# Randomly distributed, constant variance
+
+###
+#Normality
+###
+qqnorm(spec_fit_resid);qqline(spec_fit_resid)
+
+###
+#Correlatedness
+###
+(btest <- Box.test(spec_fit_resid, type = 'Ljung-Box'))
+#Residual are correlated
+spec_fit_resid <- as.xts(spec_fit_resid)
+ts.plot(spec_fit_resid)
+adf.test(spec_fit_resid)
+BoxCox.lambda(spec_fit_resid)
+
+par(mai=c(.15, .3, .3, 0.05), mgp=c(1, 0.1, 0), tck=0, mfrow=c(2,1))
+Acf(spec_fit_resid, lag.max = 100)
+Pacf(spec_fit_resid, lag.max = 100)
+#Between Seasons: Pacf is cutting off a lag 1s (s=12)
+#                 Acf is tailing off at lag 1s, 2s, 3s .....(s=12)
+#                 Imply an SAR(1), P=1, Q=0, in the season(s=12)
+#Within Seasons: Can't tell
+#Final residuals model: ARIMA(p,0,q) * (0,1,1)_{12}
+
+
+###########
+#Forecast performance(Spectral model)
+###########
+k <- length(tx_umrate_tr) # minimum data length for fitting a model
+n <- length(tx_umrate_va) + length(tx_umrate_tr)
+se_vali_spectral <- matrix(NA,n-k,27)
+st <- k
+tx_umrate_diff <- diff(tx_umrate)
+
+
+for (u in 1:3){
+  for (p in 1:3){
+    for (q in 1:3){
+      for(i in 1:(n-k))
+      {
+        xshort <- tx_umrate_diff[2:(k+i-1)]
+        xnext <- as.numeric(tx_umrate[(k + i)])
+        #Fitting spectral model
+        I <- abs(fft(xshort))^2/length(xshort)
+        P <- (4/length(xshort))*I[1:(length(xshort)/2)]
+        f = 0:(length(xshort)/2-1)/length(xshort)
+        
+        spec_fitted_resid <- spectral_helper(u,P,f,xshort)
+        spec_fcast <- spec_fitted_resid[[1]]#Fitted value and one forecasting of spectral model
+        spec_resid <- spec_fitted_resid[[2]]#Residuals of spestral model
+        
+        #Fitting residuals by using sarima
+        #Exception handling: some sarima model is not estimatable
+        indicator <- tryCatch((fit <- Arima(spec_resid, order=c(p,0,q), seasonal=list(order=c(1,1,0), period=12))),
+                 warning = function(w) NA,
+                 error = function(e) NA)
+        arima_fcast <- c(as.numeric(fitted.Arima(fit)), as.numeric(forecast(fit, h = 1)$mean))
+        rown <- (u-1)*9 + (p-1)*3+q
+        fcast_diff <- c(as.numeric(tx_umrate[1]),as.numeric(spec_fcast + arima_fcast))
+        fcast <- diffinv(fcast_diff)[2:(length(fcast_diff)+1)][[length(fcast_diff)]]
+        se_vali_spectral[i,rown] <- ifelse(is.na(indicator)[1],NA, (fcast - xnext)^2)
+     }
+   }
+ }
+}
+
+save(se_vali_spectral, file="se_vali_spectral.RData")
+load("se_vali_spectral.RData")
+mse_vali_spectral <- colMeans(se_vali_spectral,na.rm=TRUE)
+plot(1:27, mse_vali_spectral, type = "l")
+which.min(mse_vali_spectral)# Finally the model is the spectral model with u = 1 and ARIMA(2,0,3)*(1,1,0)_12
+
+###########
+#Generalization performance(Spectral model)
+###########
+k <- length(tx_umrate_va) + length(tx_umrate_tr) # minimum data length for fitting a model
+n <- length(tx_umrate)
+se_test_spectral <- matrix(NA,n-k)
+st <- k
+tx_umrate_diff <- diff(tx_umrate)
+u <- 1;p <- 2;q <- 3
+
+# Here specify u,p,q to find the test error
+for(i in 1:(n-k))
+{
+  xshort <- tx_umrate_diff[2:(k+i-1)]
+  xnext <- as.numeric(tx_umrate[(k + i)])
+  #Fitting spectral model
+  I <- abs(fft(xshort))^2/length(xshort)
+  P <- (4/length(xshort))*I[1:(length(xshort)/2)]
+  f = 0:(length(xshort)/2-1)/length(xshort)
+  
+  spec_fitted_resid <- spectral_helper(u,P,f,xshort)
+  spec_fcast <- spec_fitted_resid[[1]]#Fitted value and one forecasting of spectral model
+  spec_resid <- spec_fitted_resid[[2]]#Residuals of spestral model
+  
+  #Fitting residuals by using sarima
+  #Exception handling: some sarima model is not estimatable
+  indicator <- tryCatch((fit <- Arima(spec_resid, order=c(p,0,q), seasonal=list(order=c(1,1,0), period=12))),
+                        warning = function(w) NA,
+                        error = function(e) NA)
+  arima_fcast <- c(as.numeric(fitted.Arima(fit)), as.numeric(forecast(fit, h = 1)$mean))
+  fcast_diff <- c(as.numeric(tx_umrate[1]),as.numeric(spec_fcast + arima_fcast))
+  fcast <- diffinv(fcast_diff)[2:(length(fcast_diff)+1)][[length(fcast_diff)]]
+  se_test_spectral[i] <- ifelse(is.na(indicator)[1],NA, (fcast - xnext)^2)
+}
+
+mse_test_spectral <- colMeans(se_test_spectral,na.rm=TRUE)
+
+
+
+
+
+#Return 1. fitted value and one forecasting of specific spectral model
+#       2. residuals
+spectral_helper <- function(u,P,f,tserise){
+  if (u == 1){
+    temp_sort <- sort(as.numeric(P), decreasing = TRUE)#Find the largest periodogram number
+    com_1 <- which(P == temp_sort[1])
+    
+    freqs <- temp_sort[1]
+    lur <- length(tserise)
+    
+    f11 <- cos(2*pi*freqs[1]*1:lur); f12 <- sin(2*pi*freqs[1]*1:lur)
+    spec_fit <- lm(tserise ~ f11 + f12 - 1)
+    
+    fitted_value <- c(predict.lm(spec_fit), predict(spec_fit,predict_helper(u,freqs,lur + 1)))
+    
+    return(list(fv <- fitted_value, res <- resid(spec_fit)))
+  }
+  if (u == 2){
+    temp_sort <- sort(as.numeric(P), decreasing = TRUE)
+    com_1 <- which(P == temp_sort[1])
+    com_2 <- which(P == temp_sort[2])
+    
+    freqs <- temp_sort[1:2]
+    lur <- length(tserise)
+    
+    f11 <- cos(2*pi*freqs[1]*1:lur); f12 <- sin(2*pi*freqs[1]*1:lur)
+    f21 <- cos(2*pi*freqs[2]*1:lur); f22 <- sin(2*pi*freqs[2]*1:lur)
+    spec_fit <- lm(tserise ~ f11 + f12 + f21 + f22 - 1)
+    
+    fitted_value <- c(predict.lm(spec_fit), predict(spec_fit,predict_helper(u,freqs,lur + 1)))
+    
+    return(list(fv <- fitted_value, res <- resid(spec_fit)))
+  }
+  else{
+    temp_sort <- sort(as.numeric(P), decreasing = TRUE)
+    com_1 <- which(P == temp_sort[1])
+    com_2 <- which(P == temp_sort[2])
+    com_3 <- which(P == temp_sort[3])
+    freqs <- temp_sort[1:3]
+    lur <- length(tserise)
+    
+    f11 <- cos(2*pi*freqs[1]*1:lur); f12 <- sin(2*pi*freqs[1]*1:lur)
+    f21 <- cos(2*pi*freqs[2]*1:lur); f22 <- sin(2*pi*freqs[2]*1:lur)
+    f31 <- cos(2*pi*freqs[3]*1:lur); f32 <- sin(2*pi*freqs[3]*1:lur)
+    
+    spec_fit <- lm(tserise ~ f11 + f12 + f21 + f22 + f31 + f32 - 1)
+    
+    fitted_value <- c(predict.lm(spec_fit), predict(spec_fit,predict_helper(u,freqs,lur + 1)))
+    
+    return(list(fv <- fitted_value, res <- resid(spec_fit)))
+  }
+}
+
+
+#Helper function of spectral prediction: return one fitted value
+predict_helper <- function(u, freqs, x){
+  if (u==1){
+    f11 <- cos(2*pi*freqs[1]*x); f12 <- sin(2*pi*freqs[1]*x)
+    return(data.frame(f11,f12))
+  }
+  if (u ==2){
+    f11 <- cos(2*pi*freqs[1]*x); f12 <- sin(2*pi*freqs[1]*x)
+    f21 <- cos(2*pi*freqs[2]*x); f22 <- sin(2*pi*freqs[2]*x)
+    return(data.frame(f11,f12,f21,f22))
+  }
+  else{
+    f11 <- cos(2*pi*freqs[1]*x); f12 <- sin(2*pi*freqs[1]*x)
+    f21 <- cos(2*pi*freqs[2]*x); f22 <- sin(2*pi*freqs[2]*x)
+    f31 <- cos(2*pi*freqs[3]*x); f32 <- sin(2*pi*freqs[3]*x)
+    return(data.frame(f11,f12,f21,f22,f31,f32))
+  }
+}
