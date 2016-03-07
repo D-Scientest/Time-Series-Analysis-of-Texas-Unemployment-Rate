@@ -1,2 +1,2 @@
 # Time-Series-Analysis-of-Texas-Unemployment-Rate
-stat621
+Time Series Analysis of Texas Unemployment Rate by SARIMA and Spectral Model
